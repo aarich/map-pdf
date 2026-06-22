@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import contextily as ctx
 import argparse
 import sys
+import io
+from PIL import Image
 from pypdf import PdfWriter
 
 OUTPUT_DIR = 'out'
@@ -87,51 +89,74 @@ def generate_sheet(title, df, zoom, buffer, provider, full_gdf=None):
     print(f"Generating {title if title else 'Full Route'} Map...")
 
     if len(df) < 2:
-        return # Need at least 2 points to draw a line!
+        return None # Need at least 2 points to draw a line!
 
-    # --- SETUP 8.5 x 11 PAGE ---
-    fig = plt.figure(figsize=(8.5, 11))
-
-    ax_map = fig.add_axes([0.05, 0.2, 0.9, 0.75])
-    ax_elev = fig.add_axes([0.12, 0.08, 0.83, 0.1])
-    
-    # --- 1. PLOT THE MAP ---
-    # Convert our Lat/Lon points into a geospatial line
+    # --- 1. DETERMINE ORIENTATION ---
     line = LineString(zip(df.lon, df.lat))
     gdf = gpd.GeoDataFrame(geometry=[line], crs="EPSG:4326")
     gdf = gdf.to_crs(epsg=3857) # Web Mercator projection required for map tiles
 
+    minx, miny, maxx, maxy = gdf.total_bounds
+    buffer_meters = buffer * 1609.34
+    width = (maxx - minx) + 2 * buffer_meters
+    height = (maxy - miny) + 2 * buffer_meters
+    # rotate if the ratio is > 1.1 (to make the map fill the page better)
+    is_landscape = (width / height) > 1.1
+
+    # --- SETUP MAIN PORTRAIT PAGE ---
+    fig = plt.figure(figsize=(8.5, 11))
+    ax_map = fig.add_axes([0.05, 0.2, 0.9, 0.75])
+    ax_elev = fig.add_axes([0.12, 0.08, 0.83, 0.1])
+    
+    # Calculate stats for the title
+    _, _, total_dist, total_gain, total_elev = calc_stats(df)
+    map_title = f"{title + ': ' if title else ''}{total_dist:.1f} mi, {total_gain:.0f} ft up ({total_elev:.0f} ft net)"
+
+    if is_landscape:
+        # Create a temporary landscape figure to plot onto
+        temp_fig = plt.figure(figsize=(10, 7.5))
+        target_ax = temp_fig.add_axes([0.05, 0.05, 0.9, 0.85])
+    else:
+        target_ax = ax_map
+
+    # --- PLOT THE MAP ---
     # Plot full trail (faint) and today's trail (bold red)
     if full_gdf is not None:
-        full_gdf.plot(ax=ax_map, color='black', linewidth=2, linestyle=':', alpha=0.4, label='Full Trail')
-    gdf.plot(ax=ax_map, color='red', linewidth=3, label=f'{title + ' ' if title else ''}Route')
+        full_gdf.plot(ax=target_ax, color='red', linewidth=2, linestyle=':', alpha=0.4, label='Full Trail')
+    gdf.plot(ax=target_ax, color='red', linewidth=3, label=f'{title + " " if title else ""}Route')
 
     # Add Start/End Dots
     start_pt = gdf.geometry.iloc[0].coords[0]
     end_pt = gdf.geometry.iloc[0].coords[-1]
-    ax_map.plot(start_pt[0], start_pt[1], marker='o', color='green', markersize=10, zorder=5)
-    ax_map.plot(end_pt[0], end_pt[1], marker='s', color='blue', markersize=10, zorder=5)
+    target_ax.plot(start_pt[0], start_pt[1], marker='o', color='green', markersize=10, zorder=5)
+    target_ax.plot(end_pt[0], end_pt[1], marker='s', color='blue', markersize=10, zorder=5)
 
-    # Set map view boundaries with a buffer so we aren't zoomed in too tight
-    minx, miny, maxx, maxy = gdf.total_bounds
-    buffer_meters = buffer * 1609.34
-    ax_map.set_xlim(minx - buffer_meters, maxx + buffer_meters)
-    ax_map.set_ylim(miny - buffer_meters, maxy + buffer_meters)
+    target_ax.set_xlim(minx - buffer_meters, maxx + buffer_meters)
+    target_ax.set_ylim(miny - buffer_meters, maxy + buffer_meters)
 
-    if not zoom:
-        zoom = 'auto'
-    ctx.add_basemap(ax_map, source=PROVIDERS.get(provider), zoom=zoom, attribution=False)
-    
-    _, _, total_dist, total_gain, total_elev = calc_stats(df)
-    
-    ax_map.set_title(f"{title + ': ' if title else ''}{total_dist:.1f} mi, {total_gain:.0f} ft up ({total_elev:.0f} ft net)", fontsize=16, fontweight='bold')
-    ax_map.axis('off') # Hide the raw coordinate numbers
+    zoom_level = zoom if zoom else 'auto'
+    ctx.add_basemap(target_ax, source=PROVIDERS.get(provider), zoom=zoom_level, attribution=False)
+    target_ax.axis('off')
+
+    if is_landscape:
+        # Save the landscape map to a BytesIO buffer and rotate it
+        buf = io.BytesIO()
+        temp_fig.savefig(buf, format='png', bbox_inches='tight', dpi=400)
+        buf.seek(0)
+        img = Image.open(buf)
+        rotated_img = img.rotate(270, expand=True)
+        plt.close(temp_fig)
+
+        # Draw the rotated image on the main portrait map axis
+        ax_map.imshow(rotated_img)
+        ax_map.axis('off')
 
     # --- 2. PLOT THE ELEVATION PROFILE ---
     dist = df.dist_mi
     elev = df.ele_ft
     
     ax_elev.plot(dist, elev, color='darkred', linewidth=1)
+    ax_elev.set_title(map_title, fontsize=14, fontweight='bold')
     
     y_min = elev.min()
     y_max = elev.max()
@@ -147,17 +172,14 @@ def generate_sheet(title, df, zoom, buffer, provider, full_gdf=None):
     start_tick = int(y_min) - (int(y_min) % tick_interval)
     ax_elev.set_yticks(range(start_tick, int(elev.max()) + tick_interval, tick_interval))
 
-    
     # Profile styling
     ax_elev.set_xlabel("Cumulative Distance (mi)", fontsize=12)
     ax_elev.set_ylabel("Elevation (ft)", fontsize=12)
     ax_elev.grid(True, linestyle='--', alpha=0.6)
 
     # Save as a printable PDF
-    # adjust the map margins so they are tighter 
-
     output_file = os.path.join(OUTPUT_DIR, f"{title if title else 'Full'}.pdf")
-    plt.savefig(output_file, format='pdf')
+    plt.savefig(output_file, format='pdf', dpi=400)
     plt.close()
     
     print(f"  -> Saved {output_file}")
@@ -192,11 +214,13 @@ def generate_sheets(df, zoom, buffer, provider):
                 continue # Need at least 2 points to draw a line!
 
             file = generate_sheet(f"Day {day}", day_df, zoom, buffer, provider, full_gdf)
-            files.append(file)
+            if file:
+                files.append(file)
     
     # generate a file for the whole route
     file = generate_sheet(None, df, zoom, buffer, provider)
-    files.append(file)
+    if file:
+        files.append(file)
 
     return files
     
@@ -234,6 +258,7 @@ if __name__ == "__main__":
         merger = PdfWriter()
         for file in files:
             merger.append(file)
+
         input_file_name = args.file.split('/')[-1]
         output_file_name = input_file_name.lower().replace('.gpx', '').replace('.GPX', '')
         merger.write(os.path.join(OUTPUT_DIR, f"{output_file_name}.pdf"))
