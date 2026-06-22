@@ -1,0 +1,8 @@
+gpxpy
+pandas
+geopandas
+shapely
+matplotlib
+contextily
+argparse
+pypdf
